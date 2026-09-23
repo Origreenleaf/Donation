@@ -287,7 +287,7 @@ downloadable_datatable <- function(data, page_length = 10, filename_prefix = "ex
 # Active / Expired / One-time status for a donations table.
 donation_status <- function(data) {
   maturity <- if ("Maturity Date" %in% names(data)) suppressWarnings(as.Date(data$`Maturity Date`)) else rep(as.Date(NA), nrow(data))
-  payment_type_col <- if ("Payment Type" %in% names(data)) data$`Payment Type` else rep("", nrow(data))
+  payment_type_col <- if ("Payment type" %in% names(data)) data$`Payment type` else rep("", nrow(data))
   ifelse(
     !is.na(maturity),
     ifelse(maturity >= Sys.Date(), "Active", "Expired — renewal required"),
@@ -376,7 +376,7 @@ build_journal_entry <- function(beneficiary, amount, payment_type, start_date, m
     # these actually matches a real column in your sheet.
     `Amount`                   = as.character(amount),
     `Donation amount`          = as.character(amount),
-    `Payment Type`             = payment_type,
+    `Payment type`             = payment_type,
     `Starting Date`            = format(start_date, "%Y-%m-%d"),
     `Maturity Date`            = maturity_val,
     `Remarks`                  = combine_remarks(other_detail, remarks)
@@ -400,16 +400,16 @@ if (!(journal_sheet_name %in% existing_sheet_names)) {
   journal_header_tbl <- tibble::tibble(
     `Journal ID` = character(), `Donor ID` = character(), `Donation Beneficiary` = character(),
     `Patient ID` = character(), `External Patient Name` = character(), `External Patient Number` = character(),
-    `Bed number` = character(), `Donation amount` = character(), `Payment Type` = character(),
+    `Bed number` = character(), `Donation amount` = character(), `Payment type` = character(),
     `Starting Date` = character(), `Maturity Date` = character(), `Remarks` = character()
   )
   tryCatch(sheet_write(journal_header_tbl, ss = sheet_id, sheet = journal_sheet_name), error = function(e) NULL)
 } else {
   existing_header <- tryCatch(names(read_sheet(sheet_id, sheet = journal_sheet_name, n_max = 0, col_types = "c")), error = function(e) NULL)
-  if (!is.null(existing_header) && !("Payment Type" %in% existing_header)) {
+  if (!is.null(existing_header) && !("Payment type" %in% existing_header)) {
     tryCatch(
       range_write(
-        ss = sheet_id, data = tibble::tibble(`Payment Type` = "Payment Type"),
+        ss = sheet_id, data = tibble::tibble(`Payment type` = "Payment type"),
         sheet = journal_sheet_name, range = paste0(col_letter(length(existing_header) + 1), "1"),
         col_names = FALSE, reformat = FALSE
       ),
@@ -428,7 +428,7 @@ journal_header <- names(df_donations)
 if (length(journal_header) == 0) {
   journal_header <- c("Journal ID", "Donor ID", "Donation Beneficiary", "Patient ID",
                       "External Patient Name", "External Patient Number", "Bed number",
-                      "Donation amount", "Payment Type", "Starting Date", "Maturity Date", "Remarks")
+                      "Donation amount", "Payment type", "Starting Date", "Maturity Date", "Remarks")
 }
 
 patient_sheet_name <- get_sheet_name_by_gid(patient_sheet_id, patient_sheet_gid)
@@ -676,7 +676,7 @@ ui <- fluidPage(
                 numericInput("journal_amount", h6("Donation Amount"), value = NA, min = 0),
                 dateInput("journal_start_date", h6("Starting Date:"), value = Sys.Date())
               ),
-              layout_columns(col_widths = c(4), radioButtons("journal_payment_type", h6("Payment Type"), choices = payment_type_choices, selected = "One Time Payment", inline = TRUE)),
+              layout_columns(col_widths = c(4), radioButtons("journal_payment_type", h6("Payment type"), choices = payment_type_choices, selected = "One Time Payment", inline = TRUE)),
               
               conditionalPanel(
                 condition = "input.journal_beneficiary == 'Beds'",
@@ -759,7 +759,7 @@ ui <- fluidPage(
                 numericInput("edit_journal_amount", h6("Donation Amount"), value = NA, min = 0),
                 dateInput("edit_journal_start_date", h6("Starting Date:"), value = Sys.Date())
               ),
-              layout_columns(col_widths = c(4), radioButtons("edit_journal_payment_type", h6("Payment Type"), choices = payment_type_choices, selected = "One Time Payment", inline = TRUE)),
+              layout_columns(col_widths = c(4), radioButtons("edit_journal_payment_type", h6("Payment type"), choices = payment_type_choices, selected = "One Time Payment", inline = TRUE)),
               
               conditionalPanel(
                 condition = "input.edit_journal_beneficiary == 'Beds'",
@@ -1386,7 +1386,7 @@ server <- function(input, output, session) {
     maturity_date <- tryCatch(as.Date(maturity_str), error = function(e) NA)
     updateDateInput(session, "edit_journal_maturity_date", value = if (!is.na(maturity_date)) maturity_date else Sys.Date() %m+% months(1))
     
-    payment_type_val <- safe_val(r$`Payment Type`)
+    payment_type_val <- safe_val(r$`Payment type`)
     if (!nzchar(payment_type_val)) payment_type_val <- if (nzchar(maturity_str)) "Fixed Time Payment" else "One Time Payment"
     updateRadioButtons(session, "edit_journal_payment_type", choices = payment_type_choices, selected = payment_type_val)
     
