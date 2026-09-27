@@ -122,6 +122,14 @@ sheet_row_range <- function(row_number, ncol) {
   paste0("A", row_number, ":", col_letter(ncol), row_number)
 }
 
+# Deletes one entire row (all columns) from a sheet and shifts everything
+# below it up, so row numbers stay contiguous - this is what makes the
+# "clear the key fields and hit Save" delete gesture actually remove the
+# row rather than leaving a blank one behind.
+delete_sheet_row <- function(ss, sheet, row_number) {
+  googlesheets4::range_delete(ss = ss, sheet = sheet, range = paste0(row_number, ":", row_number), shift = "up")
+}
+
 content_type_for <- function(fname) {
   ext <- tolower(tools::file_ext(fname))
   switch(ext,
@@ -324,7 +332,7 @@ validate_org_donor <- function(org_name, contact_name, phone, email, img_name_gi
 # save handler, which previously duplicated ~150 lines of this each.
 build_journal_entry <- function(beneficiary, amount, payment_type, start_date, maturity_date,
                                 beds, patient_name, patient_phone, patient_id_input,
-                                other_detail, remarks) {
+                                other_detail, remarks, occupied_beds = character(0)) {
   errors <- c()
   if (is_blank(beneficiary)) errors <- c(errors, "Please select a donation beneficiary.")
   if (is.null(amount) || is.na(amount) || amount <= 0) errors <- c(errors, "Please enter a valid donation amount.")
@@ -347,7 +355,12 @@ build_journal_entry <- function(beneficiary, amount, payment_type, start_date, m
     if (is.null(beds) || length(beds) == 0) {
       errors <- c(errors, "Please select at least one bed.")
     } else {
-      bed_val <- paste(beds, collapse = ", ")
+      conflicts <- intersect(beds, occupied_beds)
+      if (length(conflicts) > 0) {
+        errors <- c(errors, paste0("These bed(s) are already funded until their maturity date and can't be double-booked: ", paste(conflicts, collapse = ", "), "."))
+      } else {
+        bed_val <- paste(beds, collapse = ", ")
+      }
     }
   } else if (identical(beneficiary, "External Patient")) {
     if (is_blank(patient_name) || !grepl(alpha_pattern, patient_name, perl = TRUE)) errors <- c(errors, "Please enter a valid patient name.")
@@ -391,6 +404,53 @@ journal_sheet_name   <- "Donations"
 beneficiary_choices  <- c("Beds", "Alok Katha", "Alok Boshoti", "Patients", "External Patient")
 payment_type_choices <- c("One Time Payment", "Fixed Time Payment")
 bed_choices          <- c(paste("Bed", 1:17), paste("Bed", 21:82))  # institution skips 18-20
+
+# Returns a long tibble (bed, Journal ID, Donor ID, Maturity Date) with one
+# row per bed that is currently "occupied" by an ACTIVE Beds donation - i.e.
+# Donation Beneficiary == "Beds" AND it has a Maturity Date that hasn't
+# passed yet. Per spec: a Beds donation with NO Maturity Date (e.g. a One
+# Time Payment) is ignored entirely - it never blocks the bed, since there's
+# no date range to check it against. Pass exclude_journal_id when editing an
+# existing entry so that entry's own current beds don't lock themselves out.
+active_bed_map <- function(journal_df, exclude_journal_id = NULL) {
+  empty <- tibble::tibble(bed = character(), `Journal ID` = character(), `Donor ID` = character(), `Maturity Date` = character())
+  if (is.null(journal_df) || nrow(journal_df) == 0) return(empty)
+  needed <- c("Donation Beneficiary", "Bed number", "Maturity Date")
+  if (!all(needed %in% names(journal_df))) return(empty)
+  
+  d <- journal_df
+  if (!is.null(exclude_journal_id) && "Journal ID" %in% names(d)) d <- d[d$`Journal ID` != exclude_journal_id, ]
+  d <- d[!is.na(d$`Donation Beneficiary`) & d$`Donation Beneficiary` == "Beds" &
+           !is.na(d$`Bed number`) & nzchar(trimws(d$`Bed number`)) &
+           !is.na(d$`Maturity Date`) & nzchar(trimws(d$`Maturity Date`)), ]
+  if (nrow(d) == 0) return(empty)
+  
+  maturity <- suppressWarnings(as.Date(d$`Maturity Date`))
+  d <- d[!is.na(maturity) & maturity >= Sys.Date(), ]
+  if (nrow(d) == 0) return(empty)
+  
+  rows <- lapply(seq_len(nrow(d)), function(i) {
+    beds <- trimws(strsplit(d$`Bed number`[i], ",")[[1]])
+    beds <- beds[nzchar(beds)]
+    if (length(beds) == 0) return(NULL)
+    tibble::tibble(
+      bed = beds,
+      `Journal ID` = if ("Journal ID" %in% names(d)) safe_val(d$`Journal ID`[i]) else NA_character_,
+      `Donor ID`   = if ("Donor ID" %in% names(d)) safe_val(d$`Donor ID`[i]) else NA_character_,
+      `Maturity Date` = d$`Maturity Date`[i]
+    )
+  })
+  out <- dplyr::bind_rows(rows)
+  if (is.null(out)) empty else out
+}
+
+# Bed choices with any currently-occupied beds removed, except beds in
+# `keep_selected` (used so a bed already picked for the entry being edited,
+# or already picked in the form, stays selectable/visible).
+available_bed_choices <- function(journal_df, exclude_journal_id = NULL, keep_selected = character(0)) {
+  occupied <- unique(active_bed_map(journal_df, exclude_journal_id)$bed)
+  bed_choices[bed_choices %in% union(setdiff(bed_choices, occupied), keep_selected)]
+}
 
 # ---------------------------------------------------------------------------
 # ENSURE THE DONATIONS SHEET EXISTS (must run BEFORE we read it into cache)
@@ -835,6 +895,60 @@ server <- function(input, output, session) {
   
   edit_journal_rv <- reactiveValues(journal_id = NULL, donor_id = NULL, donor_name = NULL, idx = NULL)
   
+  # ---------------------------------------------------------------------
+  # DELETE (no separate Delete button - clearing the key field(s) below and
+  # clicking the existing "Save Changes" button is the delete gesture):
+  #   - Personal donor: Donor name
+  #   - Organisation donor: Organisation Name OR Contact Name
+  #   - Journal entry: Donation Beneficiary, Donation Amount, or Starting Date
+  # A confirmation modal still appears before anything is actually removed
+  # from the sheet, since this can't be undone.
+  # ---------------------------------------------------------------------
+  pending_delete <- reactiveValues(kind = NULL, idx = NULL, id = NULL, label = NULL)
+  
+  request_delete <- function(kind, idx, id, label) {
+    pending_delete$kind <- kind; pending_delete$idx <- idx; pending_delete$id <- id; pending_delete$label <- label
+    showModal(modalDialog(
+      title = "Delete this record?",
+      paste0("The required field(s) for ", label, " are empty. Saving like that is treated as a request to permanently delete it from the sheet - this can't be undone."),
+      footer = tagList(modalButton("Cancel"), actionButton("confirm_delete_btn", "Yes, delete", class = "btn-danger")),
+      easyClose = TRUE
+    ))
+  }
+  
+  observeEvent(input$confirm_delete_btn, {
+    removeModal()
+    kind <- pending_delete$kind; idx <- pending_delete$idx; id <- pending_delete$id
+    req(kind, idx)
+    
+    if (kind == "personal") {
+      tryCatch({
+        delete_sheet_row(sheet_id, sheet = 1, row_number = idx + 1)
+        personal_data_rv(personal_data_rv()[-idx, ])
+        sync_dynamic_choices()
+        showNotification(paste("Deleted donor", id), type = "message")
+        clear_edit_form(); updateTextInput(session, "edit_donor_id", value = "")
+      }, error = function(e) showNotification(paste("Failed to delete from sheet:", e$message), type = "error"))
+    } else if (kind == "org") {
+      tryCatch({
+        delete_sheet_row(sheet_id, sheet = 2, row_number = idx + 1)
+        org_data_rv(org_data_rv()[-idx, ])
+        sync_dynamic_choices()
+        showNotification(paste("Deleted organisation donor", id), type = "message")
+        clear_edit_form(); updateTextInput(session, "edit_donor_id", value = "")
+      }, error = function(e) showNotification(paste("Failed to delete from sheet:", e$message), type = "error"))
+    } else if (kind == "journal") {
+      tryCatch({
+        delete_sheet_row(sheet_id, sheet = journal_sheet_name, row_number = idx + 1)
+        journal_all_rv(journal_all_rv()[-idx, ])
+        showNotification(paste("Deleted donation entry", id), type = "message")
+        clear_journal_edit_form(); updateTextInput(session, "edit_journal_id", value = "")
+      }, error = function(e) showNotification(paste("Failed to delete from sheet:", e$message), type = "error"))
+    }
+    
+    pending_delete$kind <- NULL; pending_delete$idx <- NULL; pending_delete$id <- NULL; pending_delete$label <- NULL
+  })
+  
   # -- Session-scoped lookups against the caches (no network calls) --------
   find_donor_row <- function(donor_type, donor_id) {
     df <- if (donor_type == "personal") personal_data_rv() else org_data_rv()
@@ -851,6 +965,14 @@ server <- function(input, output, session) {
   generate_journal_id <- function(reg_date, donor_id) {
     yy <- format(reg_date, "%y"); mm <- format(reg_date, "%m")
     generate_id_from_df(journal_all_rv(), "Journal ID", paste0("JN-", yy, mm, "-", donor_id, "-"))
+  }
+  
+  # Counts how many Donations-sheet rows still reference this Donor ID -
+  # used to block deleting a donor while they still have journal entries.
+  donor_journal_count <- function(donor_id) {
+    d <- journal_all_rv()
+    if (is.null(d) || nrow(d) == 0 || !("Donor ID" %in% names(d))) return(0L)
+    sum(!is.na(d$`Donor ID`) & d$`Donor ID` == donor_id)
   }
   
   check_duplicate <- function(email, phone, skip_donor_id = NULL) {
@@ -1192,6 +1314,18 @@ server <- function(input, output, session) {
   observeEvent(input$save_personal_edit_btn, {
     req(edit_rv$donor_type == "personal", !is.null(edit_rv$idx), edit_rv$donor_id)
     donor_id <- edit_rv$donor_id
+    
+    if (is_blank(input$edit_donor_name)) {
+      n <- donor_journal_count(donor_id)
+      if (n > 0) {
+        showNotification(paste0("Can't delete ", donor_id, " - it still has ", n, if (n == 1) " donation entry" else " donation entries",
+                                " in the Journal. Delete or reassign those first, then clear the Donor name again to delete this donor."), type = "error")
+        return()
+      }
+      request_delete(kind = "personal", idx = edit_rv$idx, id = donor_id, label = paste0("donor ", donor_id))
+      return()
+    }
+    
     errors <- validate_personal_donor(input$edit_donor_name, input$edit_email, input$edit_phone, !is_blank(input$edit_donor_img_name), !is.null(rv$edit_donor_img_file))
     if (length(errors) == 0) errors <- check_duplicate(input$edit_email, input$edit_phone, skip_donor_id = donor_id)
     if (length(errors) > 0) { showNotification(paste(errors, collapse = " "), type = "error"); return() }
@@ -1221,6 +1355,18 @@ server <- function(input, output, session) {
   observeEvent(input$save_org_edit_btn, {
     req(edit_rv$donor_type == "org", !is.null(edit_rv$idx), edit_rv$donor_id)
     donor_id <- edit_rv$donor_id
+    
+    if (is_blank(input$edit_org_donor_name) || is_blank(input$edit_org_contact_name)) {
+      n <- donor_journal_count(donor_id)
+      if (n > 0) {
+        showNotification(paste0("Can't delete ", donor_id, " - it still has ", n, if (n == 1) " donation entry" else " donation entries",
+                                " in the Journal. Delete or reassign those first, then clear Organisation Name/Contact Name again to delete this donor."), type = "error")
+        return()
+      }
+      request_delete(kind = "org", idx = edit_rv$idx, id = donor_id, label = paste0("organisation donor ", donor_id))
+      return()
+    }
+    
     errors <- validate_org_donor(input$edit_org_donor_name, input$edit_org_contact_name, input$edit_org_contact_number, input$edit_org_contact_email,
                                  !is_blank(input$edit_org_img_name), !is.null(rv$edit_org_img_file))
     if (length(errors) == 0) errors <- check_duplicate(input$edit_org_contact_email, input$edit_org_contact_number, skip_donor_id = donor_id)
@@ -1264,7 +1410,7 @@ server <- function(input, output, session) {
     updateDateInput(session, "journal_start_date", value = Sys.Date())
     updateRadioButtons(session, "journal_payment_type", choices = payment_type_choices, selected = "One Time Payment")
     updateDateInput(session, "journal_maturity_date", value = Sys.Date() %m+% months(1))
-    updateSelectizeInput(session, "journal_beds", choices = bed_choices, selected = character(0))
+    updateSelectizeInput(session, "journal_beds", choices = available_bed_choices(journal_all_rv()), selected = character(0))
     updateSelectizeInput(session, "journal_patient_id", choices = patient_choices_rv(), selected = character(0), server = TRUE)
     updateTextInput(session, "journal_patient_name", value = ""); updateTextInput(session, "journal_patient_phone", value = "")
     updateTextInput(session, "journal_other_detail", value = ""); updateTextAreaInput(session, "journal_remarks", value = "")
@@ -1304,6 +1450,20 @@ server <- function(input, output, session) {
   })
   output$journal_id_display <- renderText({ req(journal_id_rv()); journal_id_rv() })
   
+  # Keeps the "Select Bed(s)" list limited to beds that aren't currently
+  # locked in by another active (unexpired) Beds donation - re-runs whenever
+  # the beneficiary switches to "Beds" and whenever the donations cache
+  # changes (e.g. right after a submission), so two people can't both pick
+  # the same bed in the same session.
+  observe({
+    req(identical(input$journal_beneficiary, "Beds"))
+    journal_all_rv()
+    cur_sel <- isolate(input$journal_beds)
+    updateSelectizeInput(session, "journal_beds",
+                         choices = available_bed_choices(journal_all_rv(), keep_selected = cur_sel),
+                         selected = cur_sel)
+  })
+  
   observeEvent(input$submit_journal_btn, {
     req(journal_rv$donor_id)
     if (is.null(journal_id_rv())) { showNotification("Please click 'Generate Journal ID' first.", type = "error"); return() }
@@ -1312,7 +1472,8 @@ server <- function(input, output, session) {
       beneficiary = input$journal_beneficiary, amount = input$journal_amount, payment_type = input$journal_payment_type,
       start_date = input$journal_start_date, maturity_date = input$journal_maturity_date, beds = input$journal_beds,
       patient_name = input$journal_patient_name, patient_phone = input$journal_patient_phone,
-      patient_id_input = input$journal_patient_id, other_detail = input$journal_other_detail, remarks = input$journal_remarks
+      patient_id_input = input$journal_patient_id, other_detail = input$journal_other_detail, remarks = input$journal_remarks,
+      occupied_beds = unique(active_bed_map(journal_all_rv())$bed)
     )
     if (length(built$errors) > 0) { showNotification(paste(built$errors, collapse = " "), type = "error"); return() }
     
@@ -1346,7 +1507,7 @@ server <- function(input, output, session) {
     updateDateInput(session, "edit_journal_start_date", value = Sys.Date())
     updateRadioButtons(session, "edit_journal_payment_type", choices = payment_type_choices, selected = "One Time Payment")
     updateDateInput(session, "edit_journal_maturity_date", value = Sys.Date() %m+% months(1))
-    updateSelectizeInput(session, "edit_journal_beds", choices = bed_choices, selected = character(0))
+    updateSelectizeInput(session, "edit_journal_beds", choices = available_bed_choices(journal_all_rv()), selected = character(0))
     updateSelectizeInput(session, "edit_journal_patient_id", choices = patient_choices_rv(), selected = character(0), server = TRUE)
     updateTextInput(session, "edit_journal_patient_name", value = ""); updateTextInput(session, "edit_journal_patient_phone", value = "")
     updateTextInput(session, "edit_journal_other_detail", value = ""); updateTextAreaInput(session, "edit_journal_remarks", value = "")
@@ -1392,14 +1553,19 @@ server <- function(input, output, session) {
     
     updateTextAreaInput(session, "edit_journal_remarks", value = safe_val(r$Remarks))
     
-    updateSelectizeInput(session, "edit_journal_beds", choices = bed_choices, selected = character(0))
+    updateSelectizeInput(session, "edit_journal_beds", choices = available_bed_choices(journal_all_rv(), exclude_journal_id = journal_id), selected = character(0))
     updateSelectizeInput(session, "edit_journal_patient_id", choices = patient_choices_rv(), selected = character(0), server = TRUE)
     updateTextInput(session, "edit_journal_patient_name", value = ""); updateTextInput(session, "edit_journal_patient_phone", value = "")
     updateTextInput(session, "edit_journal_other_detail", value = "")
     
     if (identical(beneficiary, "Beds")) {
       beds <- trimws(strsplit(safe_val(r$`Bed number`), ",")[[1]]); beds <- beds[nzchar(beds)]
-      updateSelectizeInput(session, "edit_journal_beds", choices = union(bed_choices, beds), selected = beds)
+      # Excludes this entry's own row from the occupancy check (its beds
+      # shouldn't lock themselves out), but still hides beds actively held
+      # by any OTHER donation.
+      updateSelectizeInput(session, "edit_journal_beds",
+                           choices = available_bed_choices(journal_all_rv(), exclude_journal_id = journal_id, keep_selected = beds),
+                           selected = beds)
     } else if (identical(beneficiary, "External Patient")) {
       updateTextInput(session, "edit_journal_patient_name", value = safe_val(r$`External Patient Name`))
       updateTextInput(session, "edit_journal_patient_phone", value = safe_val(r$`External Patient Number`))
@@ -1414,14 +1580,35 @@ server <- function(input, output, session) {
   
   observeEvent(input$cancel_journal_edit_btn, clear_journal_edit_form())
   
+  # Same live-refresh as the New Donation bed picker, but excludes the
+  # journal entry currently being edited from the occupancy check so its
+  # own beds don't lock themselves out.
+  observe({
+    req(identical(input$edit_journal_beneficiary, "Beds"))
+    journal_all_rv()
+    excl <- isolate(edit_journal_rv$journal_id)
+    cur_sel <- isolate(input$edit_journal_beds)
+    updateSelectizeInput(session, "edit_journal_beds",
+                         choices = available_bed_choices(journal_all_rv(), exclude_journal_id = excl, keep_selected = cur_sel),
+                         selected = cur_sel)
+  })
+  
   observeEvent(input$save_journal_edit_btn, {
     req(edit_journal_rv$journal_id, !is.null(edit_journal_rv$idx), edit_journal_rv$donor_id)
+    
+    if (is_blank(input$edit_journal_beneficiary) ||
+        is.null(input$edit_journal_amount) || is.na(input$edit_journal_amount) ||
+        is.null(input$edit_journal_start_date) || is.na(input$edit_journal_start_date)) {
+      request_delete(kind = "journal", idx = edit_journal_rv$idx, id = edit_journal_rv$journal_id, label = paste0("donation entry ", edit_journal_rv$journal_id))
+      return()
+    }
     
     built <- build_journal_entry(
       beneficiary = input$edit_journal_beneficiary, amount = input$edit_journal_amount, payment_type = input$edit_journal_payment_type,
       start_date = input$edit_journal_start_date, maturity_date = input$edit_journal_maturity_date, beds = input$edit_journal_beds,
       patient_name = input$edit_journal_patient_name, patient_phone = input$edit_journal_patient_phone,
-      patient_id_input = input$edit_journal_patient_id, other_detail = input$edit_journal_other_detail, remarks = input$edit_journal_remarks
+      patient_id_input = input$edit_journal_patient_id, other_detail = input$edit_journal_other_detail, remarks = input$edit_journal_remarks,
+      occupied_beds = unique(active_bed_map(journal_all_rv(), exclude_journal_id = edit_journal_rv$journal_id)$bed)
     )
     if (length(built$errors) > 0) { showNotification(paste(built$errors, collapse = " "), type = "error"); return() }
     
