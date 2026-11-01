@@ -20,43 +20,7 @@ library(leaflet)
 library(rmapshaper)
 library(jsonlite)
 
-# ===========================================================================
-# CACHING MODEL (read this before editing anything below)
-# ---------------------------------------------------------------------------
-# Every donor / donation / patient table is read from Google Sheets exactly
-# ONCE per running R process (below), then kept in a per-session reactiveVal
-# ("cache"). All lookups used while typing/searching (Load Donor, Find Donor,
-# Load Journal Entry, the Patient ID search box, duplicate-email/phone
-# checks, ID generation) read from these caches instead of calling
-# read_sheet() again, so they're instant instead of round-tripping to
-# Google.
-#
-# The cache is only written back to on two occasions:
-#   1. This app successfully creates or edits a record itself -> the new/
-#      edited row is patched into the relevant cache in memory (no re-read).
-#   2. The user clicks one of the explicit "Refresh" buttons -> that does a
-#      real read_sheet() call and replaces the cache, for when someone else
-#      has changed the sheet from outside this app.
-#
-# Trade-off: if two people use this app AT THE SAME TIME, a session's cache
-# can go briefly stale relative to edits made by the other session. Click
-# "Refresh" before editing a record if you expect concurrent use, or before
-# generating a new Donor ID / Journal ID after a burst of activity.
-#
-# Two latent bugs found while doing this refactor (see notes at their
-# fix sites below):
-#   - The donations-sheet header this app creates on first run named the
-#     amount column "Amount", but the rest of the app already wrote/read a
-#     column called "Donation amount". Depending on which name is actually
-#     sitting in your live "Donations" tab's header row today, one or the
-#     other was silently failing to save/load. The code below now writes
-#     BOTH keys and reads whichever is present, so it's safe either way -
-#     but it's worth opening the sheet and checking your header once.
-#   - The journal "Reset Form" button only cleared the New Donation fields,
-#     never the Find Donor box above it - fixed below (reset_journal_all).
-# ===========================================================================
 
-# ---------------------------------------------------------------------------
 # AUTH
 # ---------------------------------------------------------------------------
 sa_path <- "service_account.json"
@@ -83,9 +47,19 @@ patient_sheet_gid <- 0
 # ---------------------------------------------------------------------------
 # PURE HELPERS (no input/output/session/reactives - safe at top level)
 # ---------------------------------------------------------------------------
-email_pattern <- "^[\\w.+-]+@[\\w-]+\\.[a-zA-Z]{2,}$"
-phone_pattern <- "^\\d{10,11}$"
-alpha_pattern <- "^[a-zA-Z ]+$"
+email_pattern <- "^[\\w.+-]+@[\\w-]+(\\.[\\w-]+)*\\.[a-zA-Z]{2,}$"
+# Three accepted shapes:
+#   1. Local number, no "+":       10-11 digits        e.g. 01712345678
+#   2. Bangladesh with "+880":     +880 then exactly 10 digits starting with 1
+#                                  e.g. +8801712345678  (+880184156487 is rejected - one digit short)
+#   3. Any other country code:     "+" then 8-15 digits, not starting with 880
+phone_pattern <- "^(\\d{10,11}|\\+8801\\d{9}|\\+(?!880)\\d{8,15})$"
+# Must start with a letter; after that letters, spaces and dots are allowed,
+# so initials like "A.K.M Nazrul Islam" or "Md. Rahim" pass.
+alpha_pattern <- "^[A-Za-z][A-Za-z. ]*$"
+
+phone_error_msg <- "Please enter a valid phone number (e.g. 01712345678, or +8801712345678 with the country code)."
+phone_placeholder <- "Insert phone number here"
 
 is_blank <- function(x) is.null(x) || length(x) == 0 || !nzchar(x)
 
@@ -305,11 +279,11 @@ donation_status <- function(data) {
 
 validate_personal_donor <- function(name, email, phone, img_name_given, img_found) {
   errors <- c()
-  if (is_blank(name) || !grepl(alpha_pattern, name, perl = TRUE)) errors <- c(errors, "Please enter a valid donor name.")
+  if (is_blank(name) || !grepl(alpha_pattern, name, perl = TRUE)) errors <- c(errors, "Please enter a valid donor name (letters, spaces and dots only).")
   has_email <- !is_blank(email); has_phone <- !is_blank(phone)
   if (!has_email && !has_phone) errors <- c(errors, "Please provide at least an email address or a phone number.")
   if (has_email && !grepl(email_pattern, email, perl = TRUE)) errors <- c(errors, "Please enter a valid email address.")
-  if (has_phone && !grepl(phone_pattern, phone, perl = TRUE)) errors <- c(errors, "Please enter a valid phone number.")
+  if (has_phone && !grepl(phone_pattern, phone, perl = TRUE)) errors <- c(errors, phone_error_msg)
   if (img_name_given && !img_found) errors <- c(errors, "Profile picture file name was not found in the Drive folder.")
   errors
 }
@@ -317,10 +291,10 @@ validate_personal_donor <- function(name, email, phone, img_name_given, img_foun
 validate_org_donor <- function(org_name, contact_name, phone, email, img_name_given, img_found) {
   errors <- c()
   if (is_blank(org_name)) errors <- c(errors, "Please enter the organisation name.")
-  if (is_blank(contact_name) || !grepl(alpha_pattern, contact_name, perl = TRUE)) errors <- c(errors, "Please enter a valid contact name.")
+  if (is_blank(contact_name) || !grepl(alpha_pattern, contact_name, perl = TRUE)) errors <- c(errors, "Please enter a valid contact name (letters, spaces and dots only).")
   has_phone <- !is_blank(phone); has_email <- !is_blank(email)
   if (!has_phone && !has_email) errors <- c(errors, "Please provide at least an email address or a phone number.")
-  if (has_phone && !grepl(phone_pattern, phone, perl = TRUE)) errors <- c(errors, "Please enter a valid phone number.")
+  if (has_phone && !grepl(phone_pattern, phone, perl = TRUE)) errors <- c(errors, phone_error_msg)
   if (has_email && !grepl(email_pattern, email, perl = TRUE)) errors <- c(errors, "Please enter a valid email address.")
   if (img_name_given && !img_found) errors <- c(errors, "Organisation profile picture file name was not found in the Drive folder.")
   errors
@@ -363,8 +337,8 @@ build_journal_entry <- function(beneficiary, amount, payment_type, start_date, m
       }
     }
   } else if (identical(beneficiary, "External Patient")) {
-    if (is_blank(patient_name) || !grepl(alpha_pattern, patient_name, perl = TRUE)) errors <- c(errors, "Please enter a valid patient name.")
-    if (is_blank(patient_phone) || !grepl(phone_pattern, patient_phone, perl = TRUE)) errors <- c(errors, "Please enter a valid patient phone number.")
+    if (is_blank(patient_name) || !grepl(alpha_pattern, patient_name, perl = TRUE)) errors <- c(errors, "Please enter a valid patient name (letters, spaces and dots only).")
+    if (is_blank(patient_phone) || !grepl(phone_pattern, patient_phone, perl = TRUE)) errors <- c(errors, paste("Patient phone:", phone_error_msg))
     ext_name_val <- patient_name; ext_phone_val <- patient_phone
   } else if (identical(beneficiary, "Patients")) {
     if (is_blank(patient_id_input)) {
@@ -401,9 +375,26 @@ build_journal_entry <- function(beneficiary, amount, payment_type, start_date, m
 # DONATION / JOURNAL STATIC CHOICES
 # ---------------------------------------------------------------------------
 journal_sheet_name   <- "Donations"
+# Built-in beneficiaries. These are always offered (and always listed
+# first) because parts of the form depend on these exact names - e.g. the
+# bed picker only appears for "Beds".
 beneficiary_choices  <- c("Beds", "Alok Katha", "Alok Boshoti", "Patients", "External Patient")
 payment_type_choices <- c("One Time Payment", "Fixed Time Payment")
 bed_choices          <- c(paste("Bed", 1:17), paste("Bed", 21:82))  # institution skips 18-20
+
+# Beneficiary dropdown choices, built the same way as compute_choice_sets():
+# the built-in options first, then every other (custom) value that is
+# actually present in the Donations sheet's "Donation Beneficiary" column
+# today, sorted and de-duplicated.
+compute_beneficiary_choices <- function(journal_df) {
+  vals <- character(0)
+  if (!is.null(journal_df) && "Donation Beneficiary" %in% names(journal_df)) {
+    vals <- as.character(journal_df$`Donation Beneficiary`)
+  }
+  vals <- unique(trimws(vals))
+  vals <- vals[!is.na(vals) & nzchar(vals)]
+  c(beneficiary_choices, sort(setdiff(vals, beneficiary_choices)))
+}
 
 # Returns a long tibble (bed, Journal ID, Donor ID, Maturity Date) with one
 # row per bed that is currently "occupied" by an ACTIVE Beds donation - i.e.
@@ -507,6 +498,8 @@ org_choices          <- initial_choice_sets$organisation
 relationship_choices <- initial_choice_sets$relationship
 reference_choices    <- initial_choice_sets$reference
 
+initial_beneficiary_choices <- compute_beneficiary_choices(df_donations)
+
 # ===========================================================================
 # UI
 # ===========================================================================
@@ -564,7 +557,7 @@ ui <- fluidPage(
               card_header("Personal Donor Details"), height = "900px",
               layout_columns(
                 col_widths = c(4, 4, 4),
-                div(textInput("donor_name", h6("Donor name:")), textOutput("donor_name_msg")),
+                div(textInput("donor_name", h6("Donor name:"), placeholder = "Insert name here"), textOutput("donor_name_msg")),
                 selectizeInput("designation", h6("Designation"), choices = designation_choices, selected = character(0),
                                options = list(create = TRUE, placeholder = "Enter Donor's Designation here", onInitialize = I('function(){this.setValue("");}'))),
                 selectizeInput("gender", h6("Gender"), choices = gender_choices, selected = character(0),
@@ -578,7 +571,7 @@ ui <- fluidPage(
                 selectizeInput("reference_per", h6("Reference:"), choices = reference_choices, selected = character(0),
                                options = list(create = TRUE, placeholder = "...", onInitialize = I('function(){this.setValue("");}'))),
                 div(textInput("email", h6("Email:")), textOutput("email_msg")),
-                div(textInput("phone", h6("Mobile phone:")), textOutput("phone_msg")),
+                div(textInput("phone", h6("Mobile phone:"), placeholder = phone_placeholder), textOutput("phone_msg")),
                 div(
                   textInput("donor_img_name", h6("Profile picture file name (incl. extension):"), placeholder = "e.g. john_smith.jpg"),
                   helpText("Upload the photo into the shared Drive folder first, then type its exact file name here."),
@@ -597,8 +590,8 @@ ui <- fluidPage(
                 col_widths = c(4, 4, 4),
                 selectizeInput("org_donor_name", h6("Organisation Name"), choices = org_choices, selected = character(0),
                                options = list(create = TRUE, placeholder = "Enter Organisation's name here", onInitialize = I('function(){this.setValue("");}'))),
-                div(textInput("org_contact_name", h6("Contact Name: "))),
-                div(textInput("org_contact_number", h6("Contact Number")), textOutput("org_phone_msg")),
+                div(textInput("org_contact_name", h6("Contact Name: "), placeholder = "Insert name here")),
+                div(textInput("org_contact_number", h6("Contact Number"), placeholder = phone_placeholder), textOutput("org_phone_msg")),
                 div(textInput("org_contact_email", h6("Email ID")), textOutput("org_email_msg")),
                 selectizeInput("designation_org", h6("Designation"), choices = designation_choices, selected = character(0),
                                options = list(create = TRUE, placeholder = "Enter Donor's Designation here", onInitialize = I('function(){this.setValue("");}'))),
@@ -649,7 +642,7 @@ ui <- fluidPage(
               layout_columns(
                 col_widths = c(4, 4, 4),
                 dateInput(inputId = "edit_reg_date", label = h6("Registration Date:"), value = Sys.Date()),
-                div(textInput("edit_donor_name", h6("Donor name:")), textOutput("edit_donor_name_msg")),
+                div(textInput("edit_donor_name", h6("Donor name:"), placeholder = "Insert name here"), textOutput("edit_donor_name_msg")),
                 selectizeInput("edit_designation", h6("Designation"), choices = designation_choices, selected = character(0), options = list(create = TRUE, placeholder = "Enter Donor's Designation here")),
                 selectizeInput("edit_gender", h6("Gender"), choices = gender_choices, selected = character(0), options = list(create = TRUE, placeholder = "...")),
                 selectizeInput("edit_industry_cat_per", h6("Industry Category"), choices = industry_choices, selected = character(0), options = list(create = TRUE, placeholder = "Enter Donor's Industry")),
@@ -657,7 +650,7 @@ ui <- fluidPage(
                 selectizeInput("edit_pre_existing_per", h6("Pre-existing Relationship"), choices = relationship_choices, selected = character(0), options = list(create = TRUE, placeholder = "...")),
                 selectizeInput("edit_reference_per", h6("Reference:"), choices = reference_choices, selected = character(0), options = list(create = TRUE, placeholder = "...")),
                 div(textInput("edit_email", h6("Email:")), textOutput("edit_email_msg")),
-                div(textInput("edit_phone", h6("Mobile phone:")), textOutput("edit_phone_msg")),
+                div(textInput("edit_phone", h6("Mobile phone:"), placeholder = phone_placeholder), textOutput("edit_phone_msg")),
                 div(
                   textInput("edit_donor_img_name", h6("Profile picture file name (incl. extension):"), placeholder = "e.g. john_smith.jpg"),
                   helpText("Leave as-is to keep the current photo, or type a different file name already uploaded to the shared Drive folder."),
@@ -679,8 +672,8 @@ ui <- fluidPage(
                 col_widths = c(4, 4, 4),
                 dateInput(inputId = "edit_reg_date", label = h6("Registration Date:"), value = Sys.Date()),
                 selectizeInput("edit_org_donor_name", h6("Organisation Name"), choices = org_choices, selected = character(0), options = list(create = TRUE, placeholder = "Enter Organisation's name here")),
-                div(textInput("edit_org_contact_name", h6("Contact Name: "))),
-                div(textInput("edit_org_contact_number", h6("Contact Number")), textOutput("edit_org_phone_msg")),
+                div(textInput("edit_org_contact_name", h6("Contact Name: "), placeholder = "Insert name here")),
+                div(textInput("edit_org_contact_number", h6("Contact Number"), placeholder = phone_placeholder), textOutput("edit_org_phone_msg")),
                 div(textInput("edit_org_contact_email", h6("Email ID")), textOutput("edit_org_email_msg")),
                 selectizeInput("edit_designation_org", h6("Designation"), choices = designation_choices, selected = character(0), options = list(create = TRUE, placeholder = "Enter Donor's Designation here")),
                 selectizeInput("edit_industry_cat", h6("Industry Category"), choices = industry_choices, selected = character(0), options = list(create = TRUE, placeholder = "Enter Donor's Industry")),
@@ -731,7 +724,7 @@ ui <- fluidPage(
               ),
               layout_columns(
                 col_widths = c(4, 4, 4),
-                selectizeInput("journal_beneficiary", h6("Donation Beneficiary"), choices = beneficiary_choices, selected = character(0),
+                selectizeInput("journal_beneficiary", h6("Donation Beneficiary"), choices = initial_beneficiary_choices, selected = character(0),
                                options = list(create = TRUE, placeholder = "Select or type a beneficiary", onInitialize = I('function(){this.setValue("");}'))),
                 numericInput("journal_amount", h6("Donation Amount"), value = NA, min = 0),
                 dateInput("journal_start_date", h6("Starting Date:"), value = Sys.Date())
@@ -747,8 +740,8 @@ ui <- fluidPage(
                 condition = "input.journal_beneficiary == 'External Patient'",
                 layout_columns(
                   col_widths = c(6, 6),
-                  div(textInput("journal_patient_name", h6("Patient Name:")), textOutput("journal_patient_name_msg")),
-                  div(textInput("journal_patient_phone", h6("Patient Phone Number:")), textOutput("journal_patient_phone_msg"))
+                  div(textInput("journal_patient_name", h6("Patient Name:"), placeholder = "Insert name here"), textOutput("journal_patient_name_msg")),
+                  div(textInput("journal_patient_phone", h6("Patient Phone Number:"), placeholder = phone_placeholder), textOutput("journal_patient_phone_msg"))
                 )
               ),
               conditionalPanel(
@@ -814,7 +807,7 @@ ui <- fluidPage(
                              div(h6("Donor Name:"), textOutput("edit_journal_donor_name_display"))),
               layout_columns(
                 col_widths = c(4, 4, 4),
-                selectizeInput("edit_journal_beneficiary", h6("Donation Beneficiary"), choices = beneficiary_choices, selected = character(0),
+                selectizeInput("edit_journal_beneficiary", h6("Donation Beneficiary"), choices = initial_beneficiary_choices, selected = character(0),
                                options = list(create = TRUE, placeholder = "Select or type a beneficiary")),
                 numericInput("edit_journal_amount", h6("Donation Amount"), value = NA, min = 0),
                 dateInput("edit_journal_start_date", h6("Starting Date:"), value = Sys.Date())
@@ -830,8 +823,8 @@ ui <- fluidPage(
                 condition = "input.edit_journal_beneficiary == 'External Patient'",
                 layout_columns(
                   col_widths = c(6, 6),
-                  div(textInput("edit_journal_patient_name", h6("Patient Name:")), textOutput("edit_journal_patient_name_msg")),
-                  div(textInput("edit_journal_patient_phone", h6("Patient Phone Number:")), textOutput("edit_journal_patient_phone_msg"))
+                  div(textInput("edit_journal_patient_name", h6("Patient Name:"), placeholder = "Insert name here"), textOutput("edit_journal_patient_name_msg")),
+                  div(textInput("edit_journal_patient_phone", h6("Patient Phone Number:"), placeholder = phone_placeholder), textOutput("edit_journal_patient_phone_msg"))
                 )
               ),
               conditionalPanel(
@@ -878,6 +871,26 @@ server <- function(input, output, session) {
     if (nrow(d) > 0) d$Status <- donation_status(d)
     d
   })
+  
+  # Current beneficiary choices, recomputed from the in-memory donations
+  # cache (no network call).
+  current_beneficiary_choices <- function() compute_beneficiary_choices(journal_all_rv())
+  
+  # Pushes the current beneficiary choices into both beneficiary dropdowns,
+  # keeping whatever is selected in each. `skip` lets a caller leave out a
+  # field it is about to reset itself (otherwise this would re-select the
+  # old value right after the reset cleared it).
+  sync_beneficiary_choices <- function(skip = character(0)) {
+    ch <- current_beneficiary_choices()
+    for (id in setdiff(c("journal_beneficiary", "edit_journal_beneficiary"), skip)) {
+      sel <- isolate(input[[id]])
+      if (is_blank(sel)) {
+        updateSelectizeInput(session, id, choices = ch, selected = character(0))
+      } else {
+        updateSelectizeInput(session, id, choices = union(ch, sel), selected = sel)
+      }
+    }
+  }
   
   # -- Image preview state ---------------------------------------------------
   rv <- reactiveValues(
@@ -941,6 +954,7 @@ server <- function(input, output, session) {
       tryCatch({
         delete_sheet_row(sheet_id, sheet = journal_sheet_name, row_number = idx + 1)
         journal_all_rv(journal_all_rv()[-idx, ])
+        sync_beneficiary_choices(skip = "edit_journal_beneficiary")
         showNotification(paste("Deleted donation entry", id), type = "message")
         clear_journal_edit_form(); updateTextInput(session, "edit_journal_id", value = "")
       }, error = function(e) showNotification(paste("Failed to delete from sheet:", e$message), type = "error"))
@@ -1031,6 +1045,7 @@ server <- function(input, output, session) {
     all_j <- tryCatch(read_sheet(sheet_id, sheet = journal_sheet_name, col_types = "c"), error = function(e) NULL)
     if (is.null(all_j)) { showNotification("Could not refresh the donations table.", type = "warning"); return() }
     journal_all_rv(all_j)
+    sync_beneficiary_choices()
   }
   
   resync_patient_choices <- function() {
@@ -1071,7 +1086,11 @@ server <- function(input, output, session) {
   })
   
   # -- Validation message outputs (one factory instead of 14 copies) -------
-  validator_msgs <- list(email = "Please enter a valid email address.", phone = "Please enter a valid phone number.", alpha = "Please enter a valid name.")
+  validator_msgs <- list(
+    email = "Please enter a valid email address.",
+    phone = phone_error_msg,
+    alpha = "Please enter a valid name (letters, spaces and dots only, starting with a letter)."
+  )
   validator_patterns <- list(email = email_pattern, phone = phone_pattern, alpha = alpha_pattern)
   register_validator <- function(output_id, input_id, kind) {
     output[[output_id]] <- renderText({
@@ -1405,7 +1424,7 @@ server <- function(input, output, session) {
   })
   
   reset_journal_entry_fields <- function() {
-    updateSelectizeInput(session, "journal_beneficiary", choices = beneficiary_choices, selected = character(0))
+    updateSelectizeInput(session, "journal_beneficiary", choices = current_beneficiary_choices(), selected = character(0))
     updateNumericInput(session, "journal_amount", value = NA)
     updateDateInput(session, "journal_start_date", value = Sys.Date())
     updateRadioButtons(session, "journal_payment_type", choices = payment_type_choices, selected = "One Time Payment")
@@ -1483,6 +1502,9 @@ server <- function(input, output, session) {
     tryCatch({
       sheet_append(sheet_id, new_row, sheet = journal_sheet_name)
       journal_all_rv(dplyr::bind_rows(journal_all_rv(), new_row))
+      # A newly typed custom beneficiary now becomes a choice in the Edit
+      # Journal dropdown too; the New Donation one is refreshed by the reset.
+      sync_beneficiary_choices(skip = "journal_beneficiary")
       showNotification(paste("Donation recorded. Journal ID:", journal_id_rv()), type = "message")
       reset_journal_entry_fields()
     }, error = function(e) showNotification(paste("Failed to write to sheet:", e$message), type = "error"))
@@ -1502,7 +1524,7 @@ server <- function(input, output, session) {
   
   clear_journal_edit_form <- function() {
     edit_journal_rv$journal_id <- NULL; edit_journal_rv$donor_id <- NULL; edit_journal_rv$donor_name <- NULL; edit_journal_rv$idx <- NULL
-    updateSelectizeInput(session, "edit_journal_beneficiary", choices = beneficiary_choices, selected = character(0))
+    updateSelectizeInput(session, "edit_journal_beneficiary", choices = current_beneficiary_choices(), selected = character(0))
     updateNumericInput(session, "edit_journal_amount", value = NA)
     updateDateInput(session, "edit_journal_start_date", value = Sys.Date())
     updateRadioButtons(session, "edit_journal_payment_type", choices = payment_type_choices, selected = "One Time Payment")
@@ -1535,7 +1557,7 @@ server <- function(input, output, session) {
     } else ""
     
     beneficiary <- safe_val(r$`Donation Beneficiary`)
-    update_choice_field("edit_journal_beneficiary", beneficiary_choices, beneficiary)
+    update_choice_field("edit_journal_beneficiary", current_beneficiary_choices(), beneficiary)
     # Read the amount under either historical column name - see the note
     # near the top of this file about the Amount / Donation amount mismatch.
     updateNumericInput(session, "edit_journal_amount", value = suppressWarnings(as.numeric(safe_val_multi(r$`Donation amount`, r$Amount))))
@@ -1621,6 +1643,7 @@ server <- function(input, output, session) {
       d <- journal_all_rv()
       for (col in names(new_row)) if (col %in% names(d)) d[[col]][edit_journal_rv$idx] <- new_row[[col]][1]
       journal_all_rv(d)
+      sync_beneficiary_choices(skip = "edit_journal_beneficiary")
       showNotification(paste("Donation updated. Journal ID:", journal_id), type = "message")
       clear_journal_edit_form(); updateTextInput(session, "edit_journal_id", value = "")
     }, error = function(e) showNotification(paste("Failed to update sheet:", e$message), type = "error"))
