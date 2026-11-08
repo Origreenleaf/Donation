@@ -40,7 +40,7 @@ gs4_auth(path = sa_path)
 drive_auth(path = sa_path)
 
 sheet_id         <- "1A1Ta-Zhz3FLk3cHXSAIaIr8SZAOKdk_kj0-2VLeH5MU"
-drive_folder_id  <- "1k0N9K56Mh90q5DAI-BD2Q6lvc3UzzuyP"  # shared with the service account as Viewer
+drive_folder_id  <- "1QY7k3Cor0pKpDtIS2CIdVgKvlDq4jJjz"  # shared with the service account as Viewer
 patient_sheet_id <- "1gAf-ZHo--M9baRjjQbKeW9B5jWXiHtkj8IXwU4gNxN4"
 patient_sheet_gid <- 0
 
