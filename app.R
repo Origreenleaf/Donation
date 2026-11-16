@@ -40,7 +40,7 @@ gs4_auth(path = sa_path)
 drive_auth(path = sa_path)
 
 sheet_id         <- "1A1Ta-Zhz3FLk3cHXSAIaIr8SZAOKdk_kj0-2VLeH5MU"
-drive_folder_id  <- "1QY7k3Cor0pKpDtIS2CIdVgKvlDq4jJjz"  # shared with the service account as Viewer
+drive_folder_id  <- "1k0N9K56Mh90q5DAI-BD2Q6lvc3UzzuyP"  # shared with the service account as Viewer
 patient_sheet_id <- "1gAf-ZHo--M9baRjjQbKeW9B5jWXiHtkj8IXwU4gNxN4"
 patient_sheet_gid <- 0
 
@@ -268,12 +268,12 @@ downloadable_datatable <- function(data, page_length = 10, filename_prefix = "ex
 
 # Active / Expired / One-time status for a donations table.
 donation_status <- function(data) {
-  maturity <- if ("Maturity Date" %in% names(data)) suppressWarnings(as.Date(data$`Maturity Date`)) else rep(as.Date(NA), nrow(data))
+  maturity <- if ("Maturity Date" %in% names(data)) safe_as_date(data$`Maturity Date`) else rep(as.Date(NA), nrow(data))
   payment_type_col <- if ("Payment type" %in% names(data)) data$`Payment type` else rep("", nrow(data))
   ifelse(
     !is.na(maturity),
     ifelse(maturity >= Sys.Date(), "Active", "Expired — renewal required"),
-    ifelse(payment_type_col == "One Time Payment", "One-time (complete)", "")
+    ifelse(!is.na(payment_type_col) & payment_type_col == one_time_label, "One-time (complete)", "")
   )
 }
 
@@ -312,7 +312,7 @@ build_journal_entry <- function(beneficiary, amount, payment_type, start_date, m
   if (is.null(amount) || is.na(amount) || amount <= 0) errors <- c(errors, "Please enter a valid donation amount.")
   if (is_blank(payment_type)) errors <- c(errors, "Please select a payment type.")
   
-  is_fixed <- identical(payment_type, "Fixed Time Payment")
+  is_fixed <- isTRUE(is_fixed_term(payment_type))
   if (is.null(start_date)) {
     errors <- c(errors, "Please provide a starting date.")
   } else if (is_fixed) {
@@ -379,7 +379,146 @@ journal_sheet_name   <- "Donations"
 # first) because parts of the form depend on these exact names - e.g. the
 # bed picker only appears for "Beds".
 beneficiary_choices  <- c("Beds", "Alok Katha", "Alok Boshoti", "Patients", "External Patient")
-payment_type_choices <- c("One Time Payment", "Fixed Time Payment")
+
+# Payment-type labels. "Fixed Time Payment" was renamed to "Fixed Term
+# Donation"; rows already in the sheet with the old wording are still
+# recognised everywhere (and shown with the new wording) via
+# is_fixed_term() / normalize_payment_type().
+one_time_label           <- "One Time Payment"
+fixed_term_label         <- "Fixed Term Donation"
+legacy_fixed_term_labels <- c("Fixed Time Payment")
+payment_type_choices     <- c(one_time_label, fixed_term_label)
+
+is_fixed_term <- function(x) {
+  x <- as.character(x)
+  !is.na(x) & x %in% c(fixed_term_label, legacy_fixed_term_labels)
+}
+normalize_payment_type <- function(x) {
+  x <- as.character(x)
+  x[!is.na(x) & x %in% legacy_fixed_term_labels] <- fixed_term_label
+  x
+}
+normalize_journal_df <- function(df) {
+  if (!is.null(df) && "Payment type" %in% names(df)) df$`Payment type` <- normalize_payment_type(df$`Payment type`)
+  df
+}
+
+# Parses sheet date strings without erroring on blanks/odd values.
+safe_as_date <- function(x) {
+  if (inherits(x, "Date")) return(x)
+  x <- trimws(as.character(x))
+  x[!is.na(x) & !nzchar(x)] <- NA
+  out <- as.Date(x, format = "%Y-%m-%d")
+  alt <- is.na(out) & !is.na(x)
+  if (any(alt)) out[alt] <- as.Date(x[alt], format = "%Y/%m/%d")
+  out
+}
+
+# "6 months 3 days (186 days)" for each start/end pair; "" where the pair
+# isn't a valid range. Vectorised so it can also fill a table column.
+term_length_label <- function(start, end) {
+  s_all <- safe_as_date(start); e_all <- safe_as_date(end)
+  out <- rep("", length(s_all))
+  ok <- !is.na(s_all) & !is.na(e_all) & e_all > s_all
+  if (!any(ok)) return(out)
+  s <- s_all[ok]; e <- e_all[ok]
+  m <- (as.integer(format(e, "%Y")) - as.integer(format(s, "%Y"))) * 12L +
+    as.integer(format(e, "%m")) - as.integer(format(s, "%m"))
+  anchor <- s %m+% months(m)
+  over <- anchor > e
+  m[over] <- m[over] - 1L
+  anchor <- s %m+% months(m)
+  d <- as.integer(e - anchor)
+  total <- as.integer(e - s)
+  plural <- function(n, unit) paste0(n, " ", unit, ifelse(n == 1, "", "s"))
+  yrs <- m %/% 12L; mon <- m %% 12L
+  parts <- mapply(function(y, mo, dd) {
+    p <- c(if (y > 0) plural(y, "year"), if (mo > 0) plural(mo, "month"), if (dd > 0 || (y == 0 && mo == 0)) plural(dd, "day"))
+    paste(p, collapse = " ")
+  }, yrs, mon, d)
+  out[ok] <- paste0(parts, " (", plural(total, "day"), " total)")
+  out
+}
+
+# ---------------------------------------------------------------------------
+# DATA QUALITY HELPERS
+# ---------------------------------------------------------------------------
+is_missing_cell <- function(x) is.na(x) | !nzchar(trimws(as.character(x)))
+
+# The amount lives under "Donation amount" or "Amount" depending on the
+# sheet's history - take whichever is filled in.
+journal_amount_vec <- function(df) {
+  n <- nrow(df)
+  a <- if ("Donation amount" %in% names(df)) as.character(df$`Donation amount`) else rep(NA_character_, n)
+  if ("Amount" %in% names(df)) {
+    b <- as.character(df$Amount)
+    a <- ifelse(is_missing_cell(a), b, a)
+  }
+  a
+}
+
+# Groups rows that share the same value(s) in key_cols (case/space-insensitive).
+# Rows where every key column is blank are ignored.
+find_duplicate_groups <- function(df, key_cols, check_label, id_col = NULL, match_label = NULL) {
+  empty <- tibble::tibble(Check = character(), `Matching on` = character(), Value = character(),
+                          Count = integer(), `Sheet rows` = character(), IDs = character())
+  if (is.null(df) || nrow(df) == 0) return(empty)
+  key_cols <- intersect(key_cols, names(df))
+  if (length(key_cols) == 0) return(empty)
+  norm <- lapply(key_cols, function(cn) tolower(trimws(dplyr::coalesce(as.character(df[[cn]]), ""))))
+  keys <- do.call(paste, c(norm, sep = "␟"))
+  all_blank <- Reduce(`&`, lapply(key_cols, function(cn) is_missing_cell(df[[cn]])))
+  keys[all_blank] <- NA
+  dup_keys <- unique(keys[!is.na(keys) & duplicated(keys)])
+  if (length(dup_keys) == 0) return(empty)
+  dplyr::bind_rows(lapply(dup_keys, function(k) {
+    ii <- which(keys == k)
+    tibble::tibble(
+      Check = check_label,
+      `Matching on` = if (is.null(match_label)) paste(key_cols, collapse = " + ") else match_label,
+      Value = paste(vapply(key_cols, function(cn) dplyr::coalesce(as.character(df[[cn]][ii[1]]), ""), ""), collapse = " | "),
+      Count = length(ii),
+      `Sheet rows` = paste(ii + 1L, collapse = ", "),
+      IDs = if (!is.null(id_col) && id_col %in% names(df)) paste(dplyr::coalesce(as.character(df[[id_col]][ii]), "(blank)"), collapse = ", ") else ""
+    )
+  }))
+}
+
+# Everything the Data Quality tab shows, computed from the in-memory caches.
+compute_data_quality <- function(journal_df, personal_df, org_df) {
+  journal_df  <- if (is.null(journal_df)) tibble::tibble() else journal_df
+  personal_df <- if (is.null(personal_df)) tibble::tibble() else personal_df
+  org_df      <- if (is.null(org_df)) tibble::tibble() else org_df
+  
+  # --- Journal / donations ---
+  jd <- journal_df
+  if (nrow(jd) > 0) jd$`Donation amount` <- journal_amount_vec(journal_df)
+  j_dups <- dplyr::bind_rows(
+    find_duplicate_groups(jd, "Journal ID", "Duplicate Journal ID", id_col = "Journal ID"),
+    find_duplicate_groups(jd, names(journal_df), "Exact duplicate row", id_col = "Journal ID", match_label = "every column"),
+    find_duplicate_groups(jd, c("Donor ID", "Donation Beneficiary", "Donation amount", "Starting Date",
+                                "Bed number", "Patient ID", "External Patient Name"),
+                          "Possible duplicate donation (same details, any Journal ID)", id_col = "Journal ID")
+  )
+  
+  # --- Donors ---
+  tag <- function(d, sheet) if (nrow(d)) dplyr::mutate(d, Sheet = sheet, .before = 1) else d
+  donor_dups <- dplyr::bind_rows(
+    tag(find_duplicate_groups(personal_df, "Donor ID", "Duplicate Donor ID", "Donor ID"), "Personal donors"),
+    tag(find_duplicate_groups(org_df, "Donor ID", "Duplicate Donor ID", "Donor ID"), "Organisation donors"),
+    tag(find_duplicate_groups(personal_df, "Email", "Duplicate email", "Donor ID"), "Personal donors"),
+    tag(find_duplicate_groups(personal_df, "Mobile Phone", "Duplicate phone", "Donor ID"), "Personal donors"),
+    tag(find_duplicate_groups(personal_df, "Donor Name", "Same donor name", "Donor ID"), "Personal donors"),
+    tag(find_duplicate_groups(org_df, "Email ID", "Duplicate email", "Donor ID"), "Organisation donors"),
+    tag(find_duplicate_groups(org_df, "Phone Number", "Duplicate phone", "Donor ID"), "Organisation donors"),
+    tag(find_duplicate_groups(org_df, c("Organisation Name", "Contact Name"), "Same organisation + contact", "Donor ID"), "Organisation donors")
+  )
+  
+  list(
+    journal_n = nrow(journal_df), journal_dups = j_dups,
+    donor_dups = donor_dups, donor_n = nrow(personal_df) + nrow(org_df)
+  )
+}
 bed_choices          <- c(paste("Bed", 1:17), paste("Bed", 21:82))  # institution skips 18-20
 
 # Beneficiary dropdown choices, built the same way as compute_choice_sets():
@@ -416,7 +555,7 @@ active_bed_map <- function(journal_df, exclude_journal_id = NULL) {
            !is.na(d$`Maturity Date`) & nzchar(trimws(d$`Maturity Date`)), ]
   if (nrow(d) == 0) return(empty)
   
-  maturity <- suppressWarnings(as.Date(d$`Maturity Date`))
+  maturity <- safe_as_date(d$`Maturity Date`)
   d <- d[!is.na(maturity) & maturity >= Sys.Date(), ]
   if (nrow(d) == 0) return(empty)
   
@@ -474,7 +613,7 @@ if (!(journal_sheet_name %in% existing_sheet_names)) {
 # ---------------------------------------------------------------------------
 df_personal    <- read_sheet(sheet_id, 1, col_types = "c")
 df_organisation <- read_sheet(sheet_id, 2, col_types = "c")
-df_donations   <- tryCatch(read_sheet(sheet_id, sheet = journal_sheet_name, col_types = "c"), error = function(e) tibble::tibble())
+df_donations   <- normalize_journal_df(tryCatch(read_sheet(sheet_id, sheet = journal_sheet_name, col_types = "c"), error = function(e) tibble::tibble()))
 journal_header <- names(df_donations)
 if (length(journal_header) == 0) {
   journal_header <- c("Journal ID", "Donor ID", "Donation Beneficiary", "Patient ID",
@@ -757,8 +896,12 @@ ui <- fluidPage(
                 textInput("journal_other_detail", h6("Additional Detail (optional):"), placeholder = "e.g. patient name / batch / notes")
               ),
               conditionalPanel(
-                condition = "input.journal_payment_type == 'Fixed Time Payment'",
-                layout_columns(col_widths = c(4), dateInput("journal_maturity_date", h6("Maturing / Closing Date:"), value = Sys.Date() %m+% months(1)))
+                condition = paste0("input.journal_payment_type == '", fixed_term_label, "'"),
+                layout_columns(
+                  col_widths = c(4, 8),
+                  dateInput("journal_maturity_date", h6("Maturing / Closing Date:"), value = Sys.Date() %m+% months(1)),
+                  div(h6("Term length:"), strong(textOutput("journal_term_length")))
+                )
               ),
               textAreaInput("journal_remarks", h6("Remarks (optional):"), rows = 2),
               card_footer(div(class = "d-flex justify-content-end gap-2",
@@ -784,6 +927,7 @@ ui <- fluidPage(
             DTOutput("all_journal_table")
           )
         ),
+        
         
         accordion_panel(
           "Edit Journal", icon = icon("pen-to-square"),
@@ -812,6 +956,7 @@ ui <- fluidPage(
                 numericInput("edit_journal_amount", h6("Donation Amount"), value = NA, min = 0),
                 dateInput("edit_journal_start_date", h6("Starting Date:"), value = Sys.Date())
               ),
+              div(class = "img-status-msg text-warning", textOutput("edit_journal_id_notice")),
               layout_columns(col_widths = c(4), radioButtons("edit_journal_payment_type", h6("Payment type"), choices = payment_type_choices, selected = "One Time Payment", inline = TRUE)),
               
               conditionalPanel(
@@ -840,8 +985,12 @@ ui <- fluidPage(
                 textInput("edit_journal_other_detail", h6("Additional Detail (optional):"), placeholder = "e.g. patient name / batch / notes")
               ),
               conditionalPanel(
-                condition = "input.edit_journal_payment_type == 'Fixed Time Payment'",
-                layout_columns(col_widths = c(4), dateInput("edit_journal_maturity_date", h6("Maturing / Closing Date:"), value = Sys.Date() %m+% months(1)))
+                condition = paste0("input.edit_journal_payment_type == '", fixed_term_label, "'"),
+                layout_columns(
+                  col_widths = c(4, 8),
+                  dateInput("edit_journal_maturity_date", h6("Maturing / Closing Date:"), value = Sys.Date() %m+% months(1)),
+                  div(h6("Term length:"), strong(textOutput("edit_journal_term_length")))
+                )
               ),
               textAreaInput("edit_journal_remarks", h6("Remarks (optional):"), rows = 2),
               card_footer(div(class = "d-flex justify-content-end gap-2",
@@ -849,6 +998,26 @@ ui <- fluidPage(
                               actionButton("cancel_journal_edit_btn", "Cancel", icon = icon("xmark"), class = "btn-outline-secondary btn-sm")))
             )
           )
+        )
+      )
+    ),
+    
+    nav_panel(
+      "Data Quality", icon = icon("clipboard-check"),
+      div(class = "d-flex justify-content-between align-items-center my-2",
+          helpText("Checks run on the data currently loaded in the app. Click Refresh to re-read the Google Sheets first."),
+          actionButton("refresh_quality_btn", "Refresh from sheets", icon = icon("rotate"), class = "btn-outline-secondary btn-sm")),
+      uiOutput("dq_summary_boxes"),
+      bslib::navset_card_tab(
+        nav_panel(
+          "Journal duplicates",
+          helpText("Duplicate Journal IDs, rows that are identical in every column, and entries with the same donor, beneficiary, amount, starting date, bed and patient (likely entered twice)."),
+          DTOutput("dq_journal_dups_tbl")
+        ),
+        nav_panel(
+          "Donor duplicates",
+          helpText("Donors sharing a Donor ID, email, phone number or name."),
+          DTOutput("dq_donor_dups_tbl")
         )
       )
     )
@@ -868,7 +1037,13 @@ server <- function(input, output, session) {
   
   journal_with_status <- reactive({
     d <- journal_all_rv()
-    if (nrow(d) > 0) d$Status <- donation_status(d)
+    if (nrow(d) > 0) {
+      d$Status <- donation_status(d)
+      if (all(c("Starting Date", "Maturity Date") %in% names(d))) {
+        d$`Term Length` <- ifelse(is_fixed_term(d$`Payment type`) | !is_missing_cell(d$`Maturity Date`),
+                                  term_length_label(d$`Starting Date`, d$`Maturity Date`), "")
+      }
+    }
     d
   })
   
@@ -1044,7 +1219,7 @@ server <- function(input, output, session) {
   resync_journal_cache <- function() {
     all_j <- tryCatch(read_sheet(sheet_id, sheet = journal_sheet_name, col_types = "c"), error = function(e) NULL)
     if (is.null(all_j)) { showNotification("Could not refresh the donations table.", type = "warning"); return() }
-    journal_all_rv(all_j)
+    journal_all_rv(normalize_journal_df(all_j))
     sync_beneficiary_choices()
   }
   
@@ -1192,9 +1367,28 @@ server <- function(input, output, session) {
   })
   output$donor_id_display <- renderText({ req(donor_id_rv()); donor_id_rv() })
   
+  # The Donor ID embeds the registration month (PD-yymm-...) and the donor
+  # type prefix, so if either changes after an ID was generated, the old ID
+  # is thrown away and a fresh one is generated for the new date/type.
+  observeEvent(list(input$donor_reg_date, input$donor_type), {
+    old_id <- donor_id_rv()
+    if (is.null(old_id) || is.null(input$donor_reg_date) || is.na(input$donor_reg_date)) return()
+    new_id <- generate_donor_id(input$donor_type, input$donor_reg_date)
+    if (!identical(new_id, old_id)) {
+      donor_id_rv(new_id)
+      showNotification(paste0("Registration date / donor type changed, so the Donor ID was regenerated: ", old_id, " → ", new_id), type = "warning")
+    }
+  }, ignoreInit = TRUE)
+  
   observeEvent(input$submit_form, {
     if (is.null(donor_id_rv())) { showNotification("Please click 'Generate Donor ID' first.", type = "error"); return() }
     donor_id <- donor_id_rv(); reg_date <- input$donor_reg_date
+    expected_prefix <- paste0(if (input$donor_type == "personal") "PD" else "OD", "-", format(reg_date, "%y%m"), "-")
+    if (!startsWith(donor_id, expected_prefix)) {
+      donor_id_rv(NULL)
+      showNotification("The Donor ID no longer matches the registration date / donor type. Please click 'Generate Donor ID' again.", type = "error")
+      return()
+    }
     
     if (input$donor_type == "personal") {
       errors <- validate_personal_donor(input$donor_name, input$email, input$phone, !is_blank(input$donor_img_name), !is.null(rv$donor_img_file))
@@ -1469,6 +1663,26 @@ server <- function(input, output, session) {
   })
   output$journal_id_display <- renderText({ req(journal_id_rv()); journal_id_rv() })
   
+  # The Journal ID embeds the starting month (JN-yymm-...), so changing the
+  # Starting Date after generating one regenerates it for the new month.
+  observeEvent(input$journal_start_date, {
+    old_id <- journal_id_rv()
+    if (is.null(old_id) || is.null(journal_rv$donor_id) || is.null(input$journal_start_date) || is.na(input$journal_start_date)) return()
+    new_id <- generate_journal_id(input$journal_start_date, journal_rv$donor_id)
+    if (!identical(new_id, old_id)) {
+      journal_id_rv(new_id)
+      showNotification(paste0("Starting date changed, so the Journal ID was regenerated: ", old_id, " → ", new_id), type = "warning")
+    }
+  }, ignoreInit = TRUE)
+  
+  term_text <- function(payment_type, start, end) {
+    if (!isTRUE(is_fixed_term(payment_type)) || is.null(start) || is.null(end) || is.na(start) || is.na(end)) return("")
+    lbl <- term_length_label(start, end)
+    if (nzchar(lbl)) lbl else "— the closing date must be after the starting date"
+  }
+  output$journal_term_length <- renderText(term_text(input$journal_payment_type, input$journal_start_date, input$journal_maturity_date))
+  output$edit_journal_term_length <- renderText(term_text(input$edit_journal_payment_type, input$edit_journal_start_date, input$edit_journal_maturity_date))
+  
   # Keeps the "Select Bed(s)" list limited to beds that aren't currently
   # locked in by another active (unexpired) Beds donation - re-runs whenever
   # the beneficiary switches to "Beds" and whenever the donations cache
@@ -1486,6 +1700,11 @@ server <- function(input, output, session) {
   observeEvent(input$submit_journal_btn, {
     req(journal_rv$donor_id)
     if (is.null(journal_id_rv())) { showNotification("Please click 'Generate Journal ID' first.", type = "error"); return() }
+    if (!startsWith(journal_id_rv(), paste0("JN-", format(input$journal_start_date, "%y%m"), "-", journal_rv$donor_id, "-"))) {
+      journal_id_rv(NULL)
+      showNotification("The Journal ID no longer matches the starting date. Please click 'Generate Journal ID' again.", type = "error")
+      return()
+    }
     
     built <- build_journal_entry(
       beneficiary = input$journal_beneficiary, amount = input$journal_amount, payment_type = input$journal_payment_type,
@@ -1569,8 +1788,8 @@ server <- function(input, output, session) {
     maturity_date <- tryCatch(as.Date(maturity_str), error = function(e) NA)
     updateDateInput(session, "edit_journal_maturity_date", value = if (!is.na(maturity_date)) maturity_date else Sys.Date() %m+% months(1))
     
-    payment_type_val <- safe_val(r$`Payment type`)
-    if (!nzchar(payment_type_val)) payment_type_val <- if (nzchar(maturity_str)) "Fixed Time Payment" else "One Time Payment"
+    payment_type_val <- normalize_payment_type(safe_val(r$`Payment type`))
+    if (!nzchar(payment_type_val)) payment_type_val <- if (nzchar(maturity_str)) fixed_term_label else one_time_label
     updateRadioButtons(session, "edit_journal_payment_type", choices = payment_type_choices, selected = payment_type_val)
     
     updateTextAreaInput(session, "edit_journal_remarks", value = safe_val(r$Remarks))
@@ -1601,6 +1820,21 @@ server <- function(input, output, session) {
   })
   
   observeEvent(input$cancel_journal_edit_btn, clear_journal_edit_form())
+  
+  # If an edited entry's Starting Date moves to a different month, it gets
+  # a new Journal ID for that month on save (IDs that don't follow the
+  # JN-yymm- pattern are left alone).
+  edit_journal_id_for_date <- function(start_date) {
+    jid <- edit_journal_rv$journal_id
+    if (is.null(jid) || is.null(start_date) || is.na(start_date) || !grepl("^JN-\\d{4}-", jid)) return(jid)
+    if (startsWith(jid, paste0("JN-", format(start_date, "%y%m"), "-"))) return(jid)
+    generate_journal_id(start_date, edit_journal_rv$donor_id)
+  }
+  output$edit_journal_id_notice <- renderText({
+    jid <- edit_journal_rv$journal_id; req(jid)
+    new_id <- edit_journal_id_for_date(input$edit_journal_start_date)
+    if (identical(new_id, jid)) "" else paste0("The Starting Date is now in a different month, so this entry will be saved under a new Journal ID: ", new_id, " (currently ", jid, ").")
+  })
   
   # Same live-refresh as the New Donation bed picker, but excludes the
   # journal entry currently being edited from the occupancy check so its
@@ -1634,7 +1868,8 @@ server <- function(input, output, session) {
     )
     if (length(built$errors) > 0) { showNotification(paste(built$errors, collapse = " "), type = "error"); return() }
     
-    journal_id <- edit_journal_rv$journal_id
+    old_journal_id <- edit_journal_rv$journal_id
+    journal_id <- edit_journal_id_for_date(input$edit_journal_start_date)
     values <- c(list(`Journal ID` = journal_id, `Donor ID` = edit_journal_rv$donor_id), built$values)
     new_row <- build_row_in_sheet_order(values, journal_header)
     
@@ -1644,10 +1879,42 @@ server <- function(input, output, session) {
       for (col in names(new_row)) if (col %in% names(d)) d[[col]][edit_journal_rv$idx] <- new_row[[col]][1]
       journal_all_rv(d)
       sync_beneficiary_choices(skip = "edit_journal_beneficiary")
-      showNotification(paste("Donation updated. Journal ID:", journal_id), type = "message")
+      showNotification(if (identical(journal_id, old_journal_id)) paste("Donation updated. Journal ID:", journal_id)
+                       else paste0("Donation updated. Starting month changed, so its Journal ID is now ", journal_id, " (was ", old_journal_id, ")."),
+                       type = "message")
       clear_journal_edit_form(); updateTextInput(session, "edit_journal_id", value = "")
     }, error = function(e) showNotification(paste("Failed to update sheet:", e$message), type = "error"))
   })
+  
+  # ---------------------------------------------------------------------
+  # DATA QUALITY
+  # ---------------------------------------------------------------------
+  dq <- reactive(compute_data_quality(journal_all_rv(), personal_data_rv(), org_data_rv()))
+  
+  observeEvent(input$refresh_quality_btn, {
+    resync_donor_caches(); resync_journal_cache()
+    showNotification("Data quality checks re-run on fresh sheet data.", type = "message")
+  })
+  
+  output$dq_summary_boxes <- renderUI({
+    q <- dq()
+    n_dup_ids   <- sum(q$journal_dups$Check == "Duplicate Journal ID")
+    n_poss_dups <- sum(q$journal_dups$Check != "Duplicate Journal ID")
+    n_donor_dups <- nrow(q$donor_dups)
+    box <- function(title, value, icon_name, bad) {
+      bslib::value_box(title = title, value = value, showcase = icon(icon_name),
+                       theme = if (bad) "danger" else "success")
+    }
+    layout_columns(
+      col_widths = c(4, 4, 4),
+      box("Duplicate Journal IDs", paste0(n_dup_ids, " (", q$journal_n, " entries)"), "clone", n_dup_ids > 0),
+      box("Possible duplicate donations", n_poss_dups, "copy", n_poss_dups > 0),
+      box("Donor duplicates", paste0(n_donor_dups, " (", q$donor_n, " donors)"), "users", n_donor_dups > 0)
+    )
+  })
+  
+  output$dq_journal_dups_tbl <- renderDT(downloadable_datatable(dq()$journal_dups, 10, "journal_duplicates"))
+  output$dq_donor_dups_tbl   <- renderDT(downloadable_datatable(dq()$donor_dups, 10, "donor_duplicates"))
   
   # -- Clean up any leftover temp preview files if the session ends -------
   session$onSessionEnded(function() {
